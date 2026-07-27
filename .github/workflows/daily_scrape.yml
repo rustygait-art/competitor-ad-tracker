@@ -3,10 +3,10 @@ name: Scheduled Competitor Ad Scraper
 on:
   schedule:
     - cron: '0 0 * * *'  # Runs daily at midnight UTC
-  workflow_dispatch:      # Manual trigger with custom input
+  workflow_dispatch:      # Allows manual trigger via Streamlit UI or GitHub Actions
     inputs:
       competitor_domain:
-        description: 'Competitor domain to scrape (e.g., hubspot.com or Salesforce.com). Leave blank to scrape defaults.'
+        description: 'Target domain to scrape'
         required: false
         default: ''
 
@@ -33,10 +33,10 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           if [ -n "${{ github.event.inputs.competitor_domain }}" ]; then
-            echo "Scraping user-provided domain: ${{ github.event.inputs.competitor_domain }}"
+            echo "Scraping target domain: ${{ github.event.inputs.competitor_domain }}"
             python scraper.py "${{ github.event.inputs.competitor_domain }}"
           else
-            echo "No custom domain provided. Running default competitor list."
+            echo "Running scheduled update for existing tracked domains."
             python scraper.py
           fi
 
