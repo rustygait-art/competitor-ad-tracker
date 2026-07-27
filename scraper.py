@@ -42,6 +42,44 @@ def analyze_ad_with_gemini(competitor, ad_copy):
     client = genai.Client(api_key=api_key)
     
     prompt = f"""
+    import requests
+
+# --- Sidebar: Trigger New Scrape ---
+st.sidebar.divider()
+st.sidebar.subheader("➕ Scrape New Competitor")
+new_domain = st.sidebar.text_input("Enter domain to analyze", placeholder="e.g. hubspot.com")
+
+if st.sidebar.button("🚀 Run Scraper", use_container_width=True):
+    if not new_domain.strip():
+        st.sidebar.warning("Please enter a valid domain.")
+    else:
+        # Retrieve secrets
+        pat = st.secrets.get("GITHUB_PAT")
+        owner = st.secrets.get("GITHUB_OWNER")
+        repo = st.secrets.get("GITHUB_REPO")
+
+        if not all([pat, owner, repo]):
+            st.sidebar.error("GitHub API secrets not configured properly.")
+        else:
+            # Trigger GitHub Action via REST API
+            api_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/daily_scrape.yml/dispatches"
+            headers = {
+                "Authorization": f"Bearer {pat}",
+                "Accept": "application/vnd.github.v3+json",
+            }
+            payload = {
+                "ref": "main",  # or master
+                "inputs": {
+                    "competitor_domain": new_domain.strip()
+                }
+            }
+            
+            response = requests.post(api_url, headers=headers, json=payload)
+            
+            if response.status_code == 204:
+                st.sidebar.success(f"Scraper triggered for `{new_domain}`! Results will appear in ~2–3 minutes.")
+            else:
+                st.sidebar.error(f"Error ({response.status_code}): {response.text}")
     You are a high-level B2B marketing strategist analyzing competitor ads.
     Competitor Domain: {competitor}
     Ad Content: {ad_copy}
