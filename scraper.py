@@ -27,7 +27,7 @@ def init_db(db_path="competitor_ads.db"):
             date_scraped TEXT
         )
     """)
-    # Automatically purge default/seed data if present
+    # Automatically purge default/seed data
     cursor.execute("""
         DELETE FROM ads 
         WHERE competitor IN ('Slack', 'Asana', 'Monday.com', 'Example', 'default') 
@@ -77,7 +77,6 @@ def analyze_ad_with_gemini(competitor, ad_copy, ad_format):
         }
 
 async def detect_ad_format(card):
-    """Inspects the creative container to determine if it is Video, Image, or Text."""
     video_elem = await card.query_selector("video, iframe[src*='youtube']")
     if video_elem:
         return "Video Ad"
@@ -87,6 +86,24 @@ async def detect_ad_format(card):
         return "Image / Visual Ad"
     
     return "Text / Search Ad"
+
+async def extract_google_creative_id(card, index, clean_domain):
+    """Extracts Google's native CR... ID from the element, or falls back to an indexed hash."""
+    try:
+        # Check for Google's native creative link/attribute
+        link_elem = await card.query_selector('a[href*="/creative/"]')
+        if link_elem:
+            href = await link_elem.get_attribute("href")
+            if "/creative/" in href:
+                cr_id = href.split("/creative/")[1].split("?")[0]
+                return f"{clean_domain}_{cr_id}"
+    except Exception:
+        pass
+
+    # Fallback: Hash outer HTML + Index to guarantee uniqueness per placement
+    html = await card.inner_html()
+    content_hash = hashlib.md5(f"{clean_domain}_{index}_{html[:200]}".encode('utf-8')).hexdigest()
+    return f"{clean_domain}_card_{index}_{content_hash[:6]}"
 
 async def dismiss_popups(page):
     try:
@@ -101,7 +118,6 @@ async def dismiss_popups(page):
         pass
 
 async def navigate_to_advertiser_profile(page):
-    """Navigates from Google domain search summary to the full Advertiser Profile."""
     try:
         advertiser_link = page.locator('a[href*="/advertiser/AR"]').first
         if await advertiser_link.count() > 0:
@@ -113,7 +129,6 @@ async def navigate_to_advertiser_profile(page):
         print(f"  [i] Directly on advertiser page: {e}")
 
 async def deep_scroll_page(page, max_idle_scrolls=5):
-    """Scrolls down dynamically until Google stops loading new creative cards."""
     previous_count = 0
     idle_count = 0
     scroll_iteration = 0
@@ -130,7 +145,7 @@ async def deep_scroll_page(page, max_idle_scrolls=5):
 
         cards = await page.query_selector_all("creative-preview")
         current_count = len(cards)
-        print(f"  Scroll #{scroll_iteration} — Ads loaded: {current_count}")
+        print(f"  Scroll #{scroll_iteration} — Total placements loaded in DOM: {current_count}")
 
         if current_count == previous_count:
             idle_count += 1
@@ -139,7 +154,6 @@ async def deep_scroll_page(page, max_idle_scrolls=5):
             previous_count = current_count
 
         if scroll_iteration >= 35:
-            print("  Reached scroll limit.")
             break
 
 async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
@@ -172,9 +186,14 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
             await deep_scroll_page(page)
 
             ad_cards = await page.query_selector_all("creative-preview")
-            print(f"\n✅ Total Creative Elements Captured: {len(ad_cards)}")
+            print(f"\n✅ Total Raw Ad Placements Captured: {len(ad_cards)}")
 
+            saved_count = 0
             for index, card in enumerate(ad_cards):
+                # Scroll individual card into view to trigger lazy loading
+                await card.scroll_into_view_if_needed()
+                
+                ad_id = await extract_google_creative_id(card, index, clean_domain)
                 text_content = await card.inner_text()
                 ad_format = await detect_ad_format(card)
 
@@ -184,10 +203,7 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
                 img_elem = await card.query_selector("img")
                 img_url = await img_elem.get_attribute("src") if img_elem else ""
 
-                unique_str = f"{clean_domain}_{text_content[:150]}_{img_url}"
-                content_hash = hashlib.md5(unique_str.encode('utf-8')).hexdigest()
-                ad_id = f"{clean_domain}_{content_hash[:10]}"
-
+                # Check if this exact Google Creative ID already exists
                 cursor.execute("SELECT id FROM ads WHERE id = ?", (ad_id,))
                 if cursor.fetchone():
                     continue
@@ -211,9 +227,11 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
                     ai_data.get("gap_analysis", ""),
                     datetime.now().strftime("%Y-%m-%d")
                 ))
-                print(f"  [+] Saved Ad [{index+1}/{len(ad_cards)}] | Type: {ad_format}")
+                saved_count += 1
+                print(f"  [+] Logged Ad Placement [{index+1}/{len(ad_cards)}] | ID: {ad_id}")
 
             conn.commit()
+            print(f"\n🎉 Scraping Complete! Saved {saved_count} new ads out of {len(ad_cards)} total placements.")
         except Exception as e:
             print(f"Error scraping {clean_domain}: {e}")
         finally:
