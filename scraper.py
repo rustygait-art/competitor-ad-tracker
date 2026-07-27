@@ -10,6 +10,7 @@ from google import genai
 from google.genai import types
 
 def init_db(db_path="competitor_ads.db"):
+    """Initializes SQLite database and creates table if missing."""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     cursor.execute("""
@@ -31,13 +32,14 @@ def init_db(db_path="competitor_ads.db"):
     conn.close()
 
 def analyze_ad_with_gemini(competitor, ad_copy):
+    """Uses Gemini 2.5 Flash to categorize and perform gap analysis on ad copy."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return {
             "theme": "General",
             "funnel_stage": "Top of Funnel",
             "summary": ad_copy[:120],
-            "gap_analysis": "GEMINI_API_KEY missing."
+            "gap_analysis": "GEMINI_API_KEY environment variable missing."
         }
 
     client = genai.Client(api_key=api_key)
@@ -50,7 +52,7 @@ def analyze_ad_with_gemini(competitor, ad_copy):
     1. "theme": Primary messaging angle (e.g., Social Proof/Case Study, Feature Highlight, Pricing/Offer, Direct Comparison, Pain Point/Compliance).
     2. "funnel_stage": Target funnel level ("Top of Funnel", "Middle of Funnel", or "Bottom of Funnel").
     3. "summary": A 1-2 sentence executive summary of the primary hook.
-    4. "gap_analysis": Strategic angle or pain point targeted.
+    4. "gap_analysis": Identify strategic angles or customer pain points targeted here that competitors frequently miss.
     """
 
     try:
@@ -70,9 +72,8 @@ def analyze_ad_with_gemini(competitor, ad_copy):
         }
 
 async def dismiss_popups(page):
-    """Dismisses any Google Cookie/Consent overlays blocking the viewport."""
+    """Dismisses Google consent/cookie overlays blocking the page."""
     try:
-        # Common selectors for Google consent buttons
         buttons = await page.query_selector_all("button")
         for btn in buttons:
             txt = (await btn.inner_text()).lower()
@@ -85,40 +86,33 @@ async def dismiss_popups(page):
         pass
 
 async def deep_scroll_page(page, max_scrolls=12):
-    """Simulates physical page scrolling to fire Google's internal AJAX observers."""
+    """Simulates physical page scrolling to fire Google's AJAX dynamic loading observers."""
     previous_count = 0
-    
     for i in range(max_scrolls):
-        # Press PageDown multiple times to trigger dynamic observers
         for _ in range(4):
             await page.keyboard.press("PageDown")
             await page.wait_for_timeout(300)
             
-        # Give Google time to return dynamic ad requests
         await page.wait_for_timeout(2000)
-        
         cards = await page.query_selector_all("creative-preview")
         current_count = len(cards)
-        print(f"  Scrolled ({i+1}/{max_scrolls}) — Found {current_count} ads so far...")
+        print(f"  Scrolled ({i+1}/{max_scrolls}) — Found {current_count} creative elements so far...")
         
-        # Stop scrolling if no new ads loaded after consecutive attempts
         if current_count == previous_count and i > 2:
-            print("  Reached end of ad stream.")
+            print("  Reached end of available ad stream.")
             break
         previous_count = current_count
 
 async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
+    """Launches Playwright, deep-scrolls Google Transparency Center, and logs all ads."""
     init_db(db_path)
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
     clean_domain = competitor_domain.replace("https://", "").replace("http://", "").replace("www.", "").strip("/")
-    
-    # URL format covering all regions and ad formats
     url = f"https://adstransparency.google.com/?region=anywhere&domain={clean_domain}"
     
     async with async_playwright() as p:
-        # Launch Chromium with explicit screen size to ensure standard layout rendering
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             viewport={"width": 1440, "height": 900},
@@ -131,13 +125,9 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
             await page.goto(url, wait_until="domcontentloaded", timeout=40000)
             await page.wait_for_timeout(4000)
 
-            # 1. Dismiss overlays
             await dismiss_popups(page)
-
-            # 2. Perform interactive deep scroll
             await deep_scroll_page(page)
 
-            # 3. Harvest creative elements
             ad_cards = await page.query_selector_all("creative-preview")
             print(f"Total Creative Elements Captured: {len(ad_cards)}")
 
@@ -149,7 +139,7 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
                 img_elem = await card.query_selector("img")
                 img_url = await img_elem.get_attribute("src") if img_elem else ""
 
-                # Create unique ID per creative
+                # MD5 hash ensures unique ads are stored without overwriting
                 unique_str = f"{clean_domain}_{text_content[:150]}_{img_url}"
                 content_hash = hashlib.md5(unique_str.encode('utf-8')).hexdigest()
                 ad_id = f"{clean_domain}_{content_hash[:10]}"
@@ -187,13 +177,32 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
             conn.close()
             await browser.close()
 
-# (Keep all existing helper functions: init_db, analyze_ad_with_gemini, dismiss_popups, deep_scroll_page, scrape_google_ads)
-
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        domain_to_scrape = sys.argv[1]
-        asyncio.run(scrape_google_ads(domain_to_scrape))
+    init_db()
+
+    # Priority 1: Domain passed via CLI argument
+    if len(sys.argv) > 1 and sys.argv[1].strip():
+        target_domain = sys.argv[1].strip()
+        print(f"🎯 Running targeted scrape for domain: {target_domain}")
+        asyncio.run(scrape_google_ads(target_domain))
+
+    # Priority 2: Re-scrape all existing domains from DB (for scheduled runs)
     else:
-        print("❌ Error: No target domain provided.")
-        print("Usage: python scraper.py <domain_name>")
-        sys.exit(1)
+        conn = sqlite3.connect("competitor_ads.db")
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT DISTINCT competitor FROM ads")
+            rows = cursor.fetchall()
+            existing_domains = [r[0] for r in rows if r[0]]
+        except Exception:
+            existing_domains = []
+        finally:
+            conn.close()
+
+        if existing_domains:
+            print(f"🔄 Re-scraping {len(existing_domains)} tracked domain(s): {existing_domains}")
+            for domain in existing_domains:
+                asyncio.run(scrape_google_ads(domain))
+        else:
+            print("ℹ️ No target domain provided and database is empty. Exiting cleanly.")
+            sys.exit(0)
