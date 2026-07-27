@@ -3,6 +3,7 @@ import os
 import sqlite3
 import json
 import asyncio
+import hashlib
 from datetime import datetime
 from playwright.async_api import async_playwright
 from google import genai
@@ -36,50 +37,11 @@ def analyze_ad_with_gemini(competitor, ad_copy):
             "theme": "General",
             "funnel_stage": "Top of Funnel",
             "summary": ad_copy[:120],
-            "gap_analysis": "GEMINI_API_KEY environment variable missing."
+            "gap_analysis": "GEMINI_API_KEY missing."
         }
 
     client = genai.Client(api_key=api_key)
-    
     prompt = f"""
-    import requests
-
-# --- Sidebar: Trigger New Scrape ---
-st.sidebar.divider()
-st.sidebar.subheader("➕ Scrape New Competitor")
-new_domain = st.sidebar.text_input("Enter domain to analyze", placeholder="e.g. hubspot.com")
-
-if st.sidebar.button("🚀 Run Scraper", use_container_width=True):
-    if not new_domain.strip():
-        st.sidebar.warning("Please enter a valid domain.")
-    else:
-        # Retrieve secrets
-        pat = st.secrets.get("GITHUB_PAT")
-        owner = st.secrets.get("GITHUB_OWNER")
-        repo = st.secrets.get("GITHUB_REPO")
-
-        if not all([pat, owner, repo]):
-            st.sidebar.error("GitHub API secrets not configured properly.")
-        else:
-            # Trigger GitHub Action via REST API
-            api_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/daily_scrape.yml/dispatches"
-            headers = {
-                "Authorization": f"Bearer {pat}",
-                "Accept": "application/vnd.github.v3+json",
-            }
-            payload = {
-                "ref": "main",  # or master
-                "inputs": {
-                    "competitor_domain": new_domain.strip()
-                }
-            }
-            
-            response = requests.post(api_url, headers=headers, json=payload)
-            
-            if response.status_code == 204:
-                st.sidebar.success(f"Scraper triggered for `{new_domain}`! Results will appear in ~2–3 minutes.")
-            else:
-                st.sidebar.error(f"Error ({response.status_code}): {response.text}")
     You are a high-level B2B marketing strategist analyzing competitor ads.
     Competitor Domain: {competitor}
     Ad Content: {ad_copy}
@@ -88,16 +50,14 @@ if st.sidebar.button("🚀 Run Scraper", use_container_width=True):
     1. "theme": Primary messaging angle (e.g., Social Proof/Case Study, Feature Highlight, Pricing/Offer, Direct Comparison, Pain Point/Compliance).
     2. "funnel_stage": Target funnel level ("Top of Funnel", "Middle of Funnel", or "Bottom of Funnel").
     3. "summary": A 1-2 sentence executive summary of the primary hook.
-    4. "gap_analysis": Identify if this ad targets a strategic angle or customer pain point that competitors frequently miss.
+    4. "gap_analysis": Strategic angle or pain point targeted.
     """
 
     try:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
+            config=types.GenerateContentConfig(response_mime_type="application/json")
         )
         return json.loads(response.text)
     except Exception as e:
@@ -109,12 +69,22 @@ if st.sidebar.button("🚀 Run Scraper", use_container_width=True):
             "gap_analysis": "Error running AI analysis."
         }
 
+async def auto_scroll(page):
+    """Scrolls down the page to trigger infinite loading for all ad cards."""
+    previous_height = await page.evaluate("document.body.scrollHeight")
+    while True:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(2500)
+        new_height = await page.evaluate("document.body.scrollHeight")
+        if new_height == previous_height:
+            break
+        previous_height = new_height
+
 async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
     init_db(db_path)
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # Clean domain input (e.g., convert https://www.hubspot.com/ -> hubspot.com)
     clean_domain = competitor_domain.replace("https://", "").replace("http://", "").replace("www.", "").strip("/")
     url = f"https://adstransparency.google.com/?region=anywhere&domain={clean_domain}"
     
@@ -125,27 +95,39 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
         )
         page = await context.new_page()
 
-        print(f"Fetching ads for: {clean_domain}...")
+        print(f"\n--- Scraping ALL ads for domain: {clean_domain} ---")
         try:
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(4000)
+            await page.goto(url, wait_until="networkidle", timeout=35000)
+            await page.wait_for_timeout(3000)
+
+            # Auto-scroll to load every single ad card available
+            print("Auto-scrolling to load entire ad index...")
+            await auto_scroll(page)
 
             ad_cards = await page.query_selector_all("creative-preview")
-            print(f"Found {len(ad_cards)} creative elements for {clean_domain}.")
+            print(f"Total creative elements discovered: {len(ad_cards)}")
 
-            for index, card in enumerate(ad_cards[:10]):
-                ad_id = f"{clean_domain}_{datetime.now().strftime('%Y%m%d')}_{index}"
+            if len(ad_cards) == 0:
+                print(f"⚠️ No ads found for '{clean_domain}'. Ensure domain name is exact (e.g. 'hubspot.com' vs 'hubspot').")
 
-                cursor.execute("SELECT id FROM ads WHERE id = ?", (ad_id,))
-                if cursor.fetchone():
-                    continue
-
+            for index, card in enumerate(ad_cards):  # Scrapes EVERY ad found (no cap)
                 text_content = await card.inner_text()
                 if not text_content.strip():
                     text_content = f"Visual Ad Creative from {clean_domain}"
 
                 img_elem = await card.query_selector("img")
                 img_url = await img_elem.get_attribute("src") if img_elem else ""
+
+                # Create a unique content hash so every ad is stored individually
+                unique_str = f"{clean_domain}_{text_content[:150]}_{img_url}"
+                content_hash = hashlib.md5(unique_str.encode('utf-8')).hexdigest()
+                ad_id = f"{clean_domain}_{content_hash[:10]}"
+
+                # Check if this exact ad already exists in our database
+                cursor.execute("SELECT id FROM ads WHERE id = ?", (ad_id,))
+                if cursor.fetchone():
+                    print(f"  [-] Ad already in database ({ad_id}). Skipping.")
+                    continue
 
                 ai_data = analyze_ad_with_gemini(clean_domain, text_content)
 
@@ -166,7 +148,7 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
                     ai_data.get("gap_analysis", ""),
                     datetime.now().strftime("%Y-%m-%d")
                 ))
-                print(f"  [+] Logged ad for {clean_domain}: {ad_id}")
+                print(f"  [+] Logged NEW ad [{index+1}/{len(ad_cards)}]: {ad_id}")
 
             conn.commit()
         except Exception as e:
@@ -176,12 +158,10 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
             await browser.close()
 
 if __name__ == "__main__":
-    # If a domain was passed via command line (e.g. `python scraper.py hubspot.com`)
     if len(sys.argv) > 1:
         domains_to_scrape = [sys.argv[1]]
     else:
-        # Default fallback list for daily scheduled runs
-        domains_to_scrape = ["slack.com", "asana.com", "monday.com", "secondfront.com"]
+        domains_to_scrape = ["slack.com", "asana.com", "monday.com"]
     
     for domain in domains_to_scrape:
         asyncio.run(scrape_google_ads(domain))
