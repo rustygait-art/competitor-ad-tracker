@@ -27,30 +27,37 @@ def init_db(db_path="competitor_ads.db"):
             date_scraped TEXT
         )
     """)
+    # Automatically purge default/seed data if present
+    cursor.execute("""
+        DELETE FROM ads 
+        WHERE competitor IN ('Slack', 'Asana', 'Monday.com', 'Example', 'default') 
+           OR competitor LIKE '%sample%'
+    """)
     conn.commit()
     conn.close()
 
-def analyze_ad_with_gemini(competitor, ad_copy):
+def analyze_ad_with_gemini(competitor, ad_copy, ad_format):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return {
-            "theme": "General",
+            "theme": "General Brand Awareness",
             "funnel_stage": "Top of Funnel",
-            "summary": ad_copy[:120],
-            "gap_analysis": "GEMINI_API_KEY environment variable missing."
+            "summary": ad_copy[:150] if ad_copy.strip() else f"Visual {ad_format} creative.",
+            "gap_analysis": "GEMINI_API_KEY missing in execution environment."
         }
 
     client = genai.Client(api_key=api_key)
     prompt = f"""
-    You are a high-level B2B marketing strategist analyzing competitor ads.
+    You are a B2B competitive intelligence strategist analyzing an ad campaign.
     Competitor Domain: {competitor}
-    Ad Content: {ad_copy}
+    Ad Format: {ad_format}
+    Extracted Text / Context: {ad_copy if ad_copy.strip() else 'Visual creative with minimal on-screen text.'}
 
-    Perform an ad classification and return strictly valid JSON matching this schema:
-    1. "theme": Primary messaging angle (e.g., Social Proof/Case Study, Feature Highlight, Pricing/Offer, Direct Comparison, Pain Point/Compliance).
-    2. "funnel_stage": Target funnel level ("Top of Funnel", "Middle of Funnel", or "Bottom of Funnel").
-    3. "summary": A 1-2 sentence executive summary of the primary hook.
-    4. "gap_analysis": Strategic angle or customer pain point targeted here.
+    Return strictly valid JSON with these keys:
+    1. "theme": Primary messaging angle (e.g., Security & Compliance, Case Study, Product Feature, Direct Comparison, Cost/ROI).
+    2. "funnel_stage": "Top of Funnel", "Middle of Funnel", or "Bottom of Funnel".
+    3. "summary": Executive summary of the core value proposition (1-2 sentences).
+    4. "gap_analysis": Strategic intent or customer pain point targeted here.
     """
 
     try:
@@ -63,39 +70,50 @@ def analyze_ad_with_gemini(competitor, ad_copy):
     except Exception as e:
         print(f"Gemini API Error: {e}")
         return {
-            "theme": "General",
+            "theme": "Product/Brand Showcase",
             "funnel_stage": "Top of Funnel",
-            "summary": ad_copy[:120],
-            "gap_analysis": "Error running AI analysis."
+            "summary": ad_copy[:150] if ad_copy.strip() else "Visual ad creative.",
+            "gap_analysis": "Unable to parse AI response."
         }
+
+async def detect_ad_format(card):
+    """Inspects the creative container to determine if it is Video, Image, or Text."""
+    video_elem = await card.query_selector("video, iframe[src*='youtube']")
+    if video_elem:
+        return "Video Ad"
+    
+    img_elem = await card.query_selector("img")
+    if img_elem:
+        return "Image / Visual Ad"
+    
+    return "Text / Search Ad"
 
 async def dismiss_popups(page):
     try:
         buttons = await page.query_selector_all("button")
         for btn in buttons:
             txt = (await btn.inner_text()).lower()
-            if "accept" in txt or "agree" in txt or "i agree" in txt:
+            if any(term in txt for term in ["accept", "agree", "i agree"]):
                 await btn.click()
                 await page.wait_for_timeout(1000)
                 break
     except Exception:
         pass
 
-async def navigate_to_advertiser_profile(page, clean_domain):
-    """If we land on a search summary page, click through to the full Advertiser Profile."""
+async def navigate_to_advertiser_profile(page):
+    """Navigates from Google domain search summary to the full Advertiser Profile."""
     try:
-        # Look for the profile card/link pointing to the full advertiser catalog
         advertiser_link = page.locator('a[href*="/advertiser/AR"]').first
         if await advertiser_link.count() > 0:
-            print("  [↗] Click-through found! Redirecting to full Advertiser Profile page...")
+            print("  [↗] Navigating to full Advertiser Profile page...")
             await advertiser_link.click()
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(3000)
     except Exception as e:
-        print(f"  [i] Directly on target page or no redirect link: {e}")
+        print(f"  [i] Directly on advertiser page: {e}")
 
 async def deep_scroll_page(page, max_idle_scrolls=5):
-    """Scrolls dynamically until Google stops appending new creative cards."""
+    """Scrolls down dynamically until Google stops loading new creative cards."""
     previous_count = 0
     idle_count = 0
     scroll_iteration = 0
@@ -103,18 +121,16 @@ async def deep_scroll_page(page, max_idle_scrolls=5):
     while idle_count < max_idle_scrolls:
         scroll_iteration += 1
         
-        # Press PageDown to trigger dynamic JSObservers
-        for _ in range(6):
+        for _ in range(5):
             await page.keyboard.press("PageDown")
-            await page.wait_for_timeout(250)
+            await page.wait_for_timeout(200)
 
-        # Scroll to absolute bottom
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(2500)  # Wait for Google's async SearchCreatives RPC call
+        await page.wait_for_timeout(2500)
 
         cards = await page.query_selector_all("creative-preview")
         current_count = len(cards)
-        print(f"  Scroll #{scroll_iteration} — Total ads loaded: {current_count}")
+        print(f"  Scroll #{scroll_iteration} — Ads loaded: {current_count}")
 
         if current_count == previous_count:
             idle_count += 1
@@ -122,8 +138,8 @@ async def deep_scroll_page(page, max_idle_scrolls=5):
             idle_count = 0
             previous_count = current_count
 
-        if scroll_iteration >= 40:  # Safety ceiling
-            print("  Reached maximum scroll ceiling.")
+        if scroll_iteration >= 35:
+            print("  Reached scroll limit.")
             break
 
 async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
@@ -133,7 +149,6 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
 
     clean_domain = competitor_domain.replace("https://", "").replace("http://", "").replace("www.", "").strip("/")
     
-    # Check if a direct Advertiser ID (AR...) was passed or a standard domain name
     if clean_domain.startswith("AR"):
         url = f"https://adstransparency.google.com/advertiser/{clean_domain}?region=anywhere"
     else:
@@ -147,27 +162,24 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
         )
         page = await context.new_page()
 
-        print(f"\n--- Deep Scraping ALL ads for: {clean_domain} ---")
+        print(f"\n--- Scraping ALL ads for: {clean_domain} ---")
         try:
             await page.goto(url, wait_until="networkidle", timeout=45000)
             await page.wait_for_timeout(3000)
 
             await dismiss_popups(page)
-            
-            # Step 1: Click through from Search Summary to Full Profile if necessary
-            await navigate_to_advertiser_profile(page, clean_domain)
-
-            # Step 2: Infinite scroll down the entire creative catalog
+            await navigate_to_advertiser_profile(page)
             await deep_scroll_page(page)
 
-            # Step 3: Parse and analyze every card found
             ad_cards = await page.query_selector_all("creative-preview")
             print(f"\n✅ Total Creative Elements Captured: {len(ad_cards)}")
 
             for index, card in enumerate(ad_cards):
                 text_content = await card.inner_text()
+                ad_format = await detect_ad_format(card)
+
                 if not text_content.strip():
-                    text_content = f"Visual Ad Creative ({clean_domain})"
+                    text_content = f"{ad_format} ({clean_domain})"
 
                 img_elem = await card.query_selector("img")
                 img_url = await img_elem.get_attribute("src") if img_elem else ""
@@ -180,7 +192,7 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
                 if cursor.fetchone():
                     continue
 
-                ai_data = analyze_ad_with_gemini(clean_domain, text_content)
+                ai_data = analyze_ad_with_gemini(clean_domain, text_content, ad_format)
 
                 cursor.execute("""
                     INSERT OR REPLACE INTO ads 
@@ -191,7 +203,7 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
                     clean_domain,
                     text_content.split('\n')[0][:100],
                     text_content,
-                    "Image/Text",
+                    ad_format,
                     img_url,
                     ai_data.get("theme", "General"),
                     ai_data.get("funnel_stage", "Top of Funnel"),
@@ -199,7 +211,7 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
                     ai_data.get("gap_analysis", ""),
                     datetime.now().strftime("%Y-%m-%d")
                 ))
-                print(f"  [+] Logged Ad [{index+1}/{len(ad_cards)}]: {ad_id}")
+                print(f"  [+] Saved Ad [{index+1}/{len(ad_cards)}] | Type: {ad_format}")
 
             conn.commit()
         except Exception as e:
@@ -212,25 +224,15 @@ if __name__ == "__main__":
     init_db()
 
     if len(sys.argv) > 1 and sys.argv[1].strip():
-        target_domain = sys.argv[1].strip()
-        print(f"🎯 Targeted scrape for domain: {target_domain}")
-        asyncio.run(scrape_google_ads(target_domain))
+        target = sys.argv[1].strip()
+        asyncio.run(scrape_google_ads(target))
     else:
         conn = sqlite3.connect("competitor_ads.db")
         cursor = conn.cursor()
-        try:
-            cursor.execute("SELECT DISTINCT competitor FROM ads")
-            rows = cursor.fetchall()
-            existing_domains = [r[0] for r in rows if r[0]]
-        except Exception:
-            existing_domains = []
-        finally:
-            conn.close()
+        cursor.execute("SELECT DISTINCT competitor FROM ads")
+        rows = cursor.fetchall()
+        domains = [r[0] for r in rows if r[0]]
+        conn.close()
 
-        if existing_domains:
-            print(f"🔄 Re-scraping tracked domain(s): {existing_domains}")
-            for domain in existing_domains:
-                asyncio.run(scrape_google_ads(domain))
-        else:
-            print("ℹ️ Database is empty and no domain was specified.")
-            sys.exit(0)
+        for domain in domains:
+            asyncio.run(scrape_google_ads(domain))
