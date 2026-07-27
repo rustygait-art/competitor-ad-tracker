@@ -187,11 +187,13 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
             conn.close()
             await browser.close()
 
+# (Keep all existing helper functions: init_db, analyze_ad_with_gemini, dismiss_popups, deep_scroll_page, scrape_google_ads)
+
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        domains_to_scrape = [sys.argv[1]]
+        domain_to_scrape = sys.argv[1]
+        asyncio.run(scrape_google_ads(domain_to_scrape))
     else:
-        domains_to_scrape = ["secondfront.com"]
-    
-    for domain in domains_to_scrape:
-        asyncio.run(scrape_google_ads(domain))
+        print("❌ Error: No target domain provided.")
+        print("Usage: python scraper.py <domain_name>")
+        sys.exit(1)
