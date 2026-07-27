@@ -161,7 +161,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         domains_to_scrape = [sys.argv[1]]
     else:
-        domains_to_scrape = ["slack.com", "asana.com", "monday.com"]
+        domains_to_scrape = ["secondfront.com"]
     
     for domain in domains_to_scrape:
         asyncio.run(scrape_google_ads(domain))
