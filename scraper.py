@@ -181,7 +181,7 @@ if __name__ == "__main__":
         domains_to_scrape = [sys.argv[1]]
     else:
         # Default fallback list for daily scheduled runs
-        domains_to_scrape = ["slack.com", "asana.com", "monday.com"]
+        domains_to_scrape = ["slack.com", "asana.com", "monday.com", "secondfront.com"]
     
     for domain in domains_to_scrape:
         asyncio.run(scrape_google_ads(domain))
