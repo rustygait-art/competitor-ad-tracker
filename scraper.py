@@ -69,16 +69,43 @@ def analyze_ad_with_gemini(competitor, ad_copy):
             "gap_analysis": "Error running AI analysis."
         }
 
-async def auto_scroll(page):
-    """Scrolls down the page to trigger infinite loading for all ad cards."""
-    previous_height = await page.evaluate("document.body.scrollHeight")
-    while True:
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(2500)
-        new_height = await page.evaluate("document.body.scrollHeight")
-        if new_height == previous_height:
+async def dismiss_popups(page):
+    """Dismisses any Google Cookie/Consent overlays blocking the viewport."""
+    try:
+        # Common selectors for Google consent buttons
+        buttons = await page.query_selector_all("button")
+        for btn in buttons:
+            txt = (await btn.inner_text()).lower()
+            if "accept" in txt or "agree" in txt or "i agree" in txt:
+                await btn.click()
+                print("  [+] Dismissed consent popup.")
+                await page.wait_for_timeout(1000)
+                break
+    except Exception:
+        pass
+
+async def deep_scroll_page(page, max_scrolls=12):
+    """Simulates physical page scrolling to fire Google's internal AJAX observers."""
+    previous_count = 0
+    
+    for i in range(max_scrolls):
+        # Press PageDown multiple times to trigger dynamic observers
+        for _ in range(4):
+            await page.keyboard.press("PageDown")
+            await page.wait_for_timeout(300)
+            
+        # Give Google time to return dynamic ad requests
+        await page.wait_for_timeout(2000)
+        
+        cards = await page.query_selector_all("creative-preview")
+        current_count = len(cards)
+        print(f"  Scrolled ({i+1}/{max_scrolls}) — Found {current_count} ads so far...")
+        
+        # Stop scrolling if no new ads loaded after consecutive attempts
+        if current_count == previous_count and i > 2:
+            print("  Reached end of ad stream.")
             break
-        previous_height = new_height
+        previous_count = current_count
 
 async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
     init_db(db_path)
@@ -86,47 +113,50 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
     cursor = conn.cursor()
 
     clean_domain = competitor_domain.replace("https://", "").replace("http://", "").replace("www.", "").strip("/")
+    
+    # URL format covering all regions and ad formats
     url = f"https://adstransparency.google.com/?region=anywhere&domain={clean_domain}"
     
     async with async_playwright() as p:
+        # Launch Chromium with explicit screen size to ensure standard layout rendering
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
+            viewport={"width": 1440, "height": 900},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
 
-        print(f"\n--- Scraping ALL ads for domain: {clean_domain} ---")
+        print(f"\n--- Deep Scraping ALL ads for: {clean_domain} ---")
         try:
-            await page.goto(url, wait_until="networkidle", timeout=35000)
-            await page.wait_for_timeout(3000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=40000)
+            await page.wait_for_timeout(4000)
 
-            # Auto-scroll to load every single ad card available
-            print("Auto-scrolling to load entire ad index...")
-            await auto_scroll(page)
+            # 1. Dismiss overlays
+            await dismiss_popups(page)
 
+            # 2. Perform interactive deep scroll
+            await deep_scroll_page(page)
+
+            # 3. Harvest creative elements
             ad_cards = await page.query_selector_all("creative-preview")
-            print(f"Total creative elements discovered: {len(ad_cards)}")
+            print(f"Total Creative Elements Captured: {len(ad_cards)}")
 
-            if len(ad_cards) == 0:
-                print(f"⚠️ No ads found for '{clean_domain}'. Ensure domain name is exact (e.g. 'hubspot.com' vs 'hubspot').")
-
-            for index, card in enumerate(ad_cards):  # Scrapes EVERY ad found (no cap)
+            for index, card in enumerate(ad_cards):
                 text_content = await card.inner_text()
                 if not text_content.strip():
-                    text_content = f"Visual Ad Creative from {clean_domain}"
+                    text_content = f"Visual Ad Creative ({clean_domain})"
 
                 img_elem = await card.query_selector("img")
                 img_url = await img_elem.get_attribute("src") if img_elem else ""
 
-                # Create a unique content hash so every ad is stored individually
+                # Create unique ID per creative
                 unique_str = f"{clean_domain}_{text_content[:150]}_{img_url}"
                 content_hash = hashlib.md5(unique_str.encode('utf-8')).hexdigest()
                 ad_id = f"{clean_domain}_{content_hash[:10]}"
 
-                # Check if this exact ad already exists in our database
                 cursor.execute("SELECT id FROM ads WHERE id = ?", (ad_id,))
                 if cursor.fetchone():
-                    print(f"  [-] Ad already in database ({ad_id}). Skipping.")
+                    print(f"  [-] Ad already exists in DB: {ad_id}")
                     continue
 
                 ai_data = analyze_ad_with_gemini(clean_domain, text_content)
@@ -148,7 +178,7 @@ async def scrape_google_ads(competitor_domain, db_path="competitor_ads.db"):
                     ai_data.get("gap_analysis", ""),
                     datetime.now().strftime("%Y-%m-%d")
                 ))
-                print(f"  [+] Logged NEW ad [{index+1}/{len(ad_cards)}]: {ad_id}")
+                print(f"  [+] Logged Ad [{index+1}/{len(ad_cards)}]: {ad_id}")
 
             conn.commit()
         except Exception as e:
